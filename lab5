@@ -1,0 +1,155 @@
+// do_execve - call exit_mmap(mm)&put_pgdir(mm) to reclaim memory space of current process
+//           - call load_icode to setup new memory space accroding binary prog.
+int
+do_execve(const char *name, size_t len, unsigned char *binary, size_t size) {
+    struct mm_struct *mm = current->mm;
+    if (!user_mem_check(mm, (uintptr_t)name, len, 0)) {
+        return -E_INVAL;
+    }
+    if (len > PROC_NAME_LEN) {
+        len = PROC_NAME_LEN;
+    }
+
+    char local_name[PROC_NAME_LEN + 1];
+    memset(local_name, 0, sizeof(local_name));
+    memcpy(local_name, name, len);
+    //清空空间
+    if (mm != NULL) {
+        lcr3(boot_cr3);
+        if (mm_count_dec(mm) == 0) {
+            exit_mmap(mm);//清空内存管理部分和对应页表
+            put_pgdir(mm);//清空页表
+            mm_destroy(mm);//清空内存
+        }
+        current->mm = NULL;
+    }
+    int ret;
+    //向清空的空间填充新内容，调用load_icode
+    if ((ret = load_icode(binary, size)) != 0) {
+        goto execve_exit;
+    }
+    set_proc_name(current, local_name);
+    return 0;
+
+execve_exit:
+    do_exit(ret);
+    panic("already exit: %e.\n", ret);
+}
+static int
+copy_mm(uint32_t clone_flags, struct proc_struct *proc) {
+    struct mm_struct *mm, *oldmm = current->mm;
+
+    /* current is a kernel thread */
+    if (oldmm == NULL) {  //当前进程地址空间为NULL，则复制失败，返回0
+        return 0;
+    }
+    if (clone_flags & CLONE_VM) {  //如果共享内存的标记位为真，则可以共享内存
+        mm = oldmm;
+        goto good_mm;
+    }
+
+    int ret = -E_NO_MEM;
+    if ((mm = mm_create()) == NULL) {  //如果创建地址空间失败，报错
+        goto bad_mm;
+    }
+    if (setup_pgdir(mm) != 0) {  //如果创建页表失败，报错
+        goto bad_pgdir_cleanup_mm;
+    }
+		//打开互斥锁(用于避免多个进程同时访问内存)
+    lock_mm(oldmm);
+    {
+        ret = dup_mmap(mm, oldmm);  //调用了dup_mmap函数
+    }
+    unlock_mm(oldmm);  //关闭互斥锁
+
+    if (ret != 0) {
+        goto bad_dup_cleanup_mmap;
+    }
+
+good_mm:
+    mm_count_inc(mm);
+    proc->mm = mm;
+    proc->cr3 = PADDR(mm->pgdir);
+    return 0;
+bad_dup_cleanup_mmap:
+    exit_mmap(mm);
+    put_pgdir(mm);
+bad_pgdir_cleanup_mm:
+    mm_destroy(mm);
+bad_mm:
+    return ret;
+}
+int
+dup_mmap(struct mm_struct *to, struct mm_struct *from) {
+    assert(to != NULL && from != NULL);  //保证非空，确保to和from创建成功
+    list_entry_t *list = &(from->mmap_list), *le = list;
+    //获取from的首地址
+    while ((le = list_prev(le)) != list) {  //遍历所有段
+        struct vma_struct *vma, *nvma;
+        vma = le2vma(le, list_link);  //获取某一段的信息,并创建到新进程中。
+        nvma = vma_create(vma->vm_start, vma->vm_end, vma->vm_flags);
+        if (nvma == NULL) {
+            return -E_NO_MEM;
+        }
+
+        insert_vma_struct(to, nvma);
+
+        bool share = 0;
+        if (copy_range(to->pgdir, from->pgdir, vma->vm_start, vma->vm_end, share) != 0) {
+            return -E_NO_MEM;
+        }
+    }
+    return 0;
+}
+int
+copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share) {
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
+    // copy content by page unit.
+    do {
+        //call get_pte to find process A's pte according to the addr start
+        pte_t *ptep = get_pte(from, start, 0), *nptep;
+        //获取页表内容
+        if (ptep == NULL) {
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue ;
+        }
+        //call get_pte to find process B's pte according to the addr start. If pte is NULL, just alloc a PT
+        if (*ptep & PTE_P) {
+            if ((nptep = get_pte(to, start, 1)) == NULL) {
+                return -E_NO_MEM;
+            }
+        uint32_t perm = (*ptep & PTE_USER);
+        //从ptep中获取页表的值
+        struct Page *page = pte2page(*ptep);
+        // alloc a page for process B
+        struct Page *npage=alloc_page();
+        assert(page!=NULL);
+        assert(npage!=NULL);
+        int ret=0;
+        /* LAB5:EXERCISE2 YOUR CODE
+         * replicate content of page to npage, build the map of phy addr of nage with the linear addr start
+         *
+         * Some Useful MACROs and DEFINEs, you can use them in below implementation.
+         * MACROs or Functions:
+         *    page2kva(struct Page *page): return the kernel vritual addr of memory which page managed (SEE pmm.h)
+         *    page_insert: build the map of phy addr of an Page with the linear addr la
+         *    memcpy: typical memory copy function
+         *
+         * (1) find src_kvaddr: the kernel virtual address of page
+         * (2) find dst_kvaddr: the kernel virtual address of npage
+         * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
+         * (4) build the map of phy addr of  nage with the linear addr start
+         */
+        void * kva_src = page2kva(page);	//获取老页表的值(1)
+        void * kva_dst = page2kva(npage);	//获取新页表的值(2)
+        memcpy(kva_dst, kva_src, PGSIZE);	//复制(3)
+        ret = page_insert(to, npage, start, perm);
+        //
+建立建立子进程页地址起始位置与物理地址的映射关系(4)
+        assert(ret == 0);
+        }
+        start += PGSIZE;
+    } while (start != 0 && start < end);
+    return 0;
+}
